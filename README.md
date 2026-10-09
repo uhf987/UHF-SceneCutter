@@ -54,6 +54,12 @@ When you cut at a non-keyframe position:
 
 This gives frame-accurate cuts while keeping 99%+ of the file as a lossless copy.
 
+Implementation notes (see `exporter.js`):
+- Only the real video stream is probed and mapped — MP4 cover art (a PNG "video" stream) is ignored.
+- Re-encoded head/tail pieces copy the source's profile, level, pix_fmt, colour tags, exact fps and (for x264 sources) its ref/bframes/pyramid settings.
+- H.264/HEVC pieces are stored as MPEG-TS so every piece carries its own SPS/PPS, then joined with `-c copy`.
+- Cuts are made in whole frames (`-frames:v`), audio is cut sample-accurately in one pass.
+
 ## License
 
 MIT

@@ -13,6 +13,7 @@
     "productName": "Scene Cutter",
     "files": [
       "main.js",
+      "exporter.js",
       "renderer.js",
       "preload.js",
       "index.html",
