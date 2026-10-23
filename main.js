@@ -236,6 +236,68 @@ ipcMain.handle('detect-scenes-range', async (_, fp, th, rangeStart, rangeEnd) =>
   proc.on('error', rej);
 }));
 
+// ─── single-scene bounds around a time (fast "Analyze Scene") ────────────────
+// Forward: scan from t until the FIRST cut, then kill ffmpeg (stops early).
+// Backward: scan windows going back from t (30s, 60s, 120s...) until a cut is found.
+function scanCuts(fp, th, from, len, stopAtFirstAfter, onProgress) {
+  return new Promise((res) => {
+    const args = ['-ss', String(from)];
+    args.push('-i', fp);
+    if (len) args.push('-t', String(len));
+    args.push('-vf', `select='gt(scene,${th})',showinfo`, '-vsync','0','-an','-f','null','-');
+    const proc = spawn(ffmpegPath, args);
+    let buf = '', done = false;
+    const pts = [];
+    const finish = () => { if (!done) { done = true; res(pts); } };
+    proc.stderr.on('data', d => {
+      buf += d.toString();
+      const re = /pts_time:([\d.]+)/g; let m, last = 0;
+      while ((m = re.exec(buf)) !== null) {
+        last = re.lastIndex;
+        const t = parseFloat(m[1]) + from;
+        if (isNaN(t)) continue;
+        pts.push(t);
+        if (stopAtFirstAfter !== null && t > stopAtFirstAfter) { try { proc.kill(); } catch(_) {} finish(); return; }
+      }
+      buf = buf.slice(last);
+      if (onProgress) {
+        const tm = d.toString().match(/time=(\d+):(\d+):(\d+)/);
+        if (tm) onProgress(+tm[1]*3600 + +tm[2]*60 + +tm[3]);
+      }
+    });
+    proc.on('close', finish);
+    proc.on('error', finish);
+  });
+}
+
+ipcMain.handle('detect-scene-bounds', async (_, fp, th, t, total, lo, hi) => {
+  const threshold = typeof th === 'number' ? th : 0.3;
+  const floor = typeof lo === 'number' ? lo : 0;       // don't search before this
+  const ceil  = typeof hi === 'number' ? hi : total;   // don't search after this
+  const GAP = 0.3;
+
+  // forward: first cut after the playhead
+  const fwdSpan = Math.max(0.1, ceil - t);
+  const fwd = await scanCuts(fp, threshold, t, fwdSpan, t + GAP, s => {
+    mainWindow.webContents.send('detect-progress', Math.min(99, Math.round(s / fwdSpan * 100)));
+  });
+  const next = fwd.find(x => x > t + GAP && x < ceil);
+  const end = next !== undefined ? next : ceil;
+
+  // backward: last cut at/before the playhead
+  let start = floor, e = Math.min(ceil, t + 0.1), step = 30;
+  while (e > floor + 0.05) {
+    const rs = Math.max(floor, e - step);
+    const pts = await scanCuts(fp, threshold, rs, e - rs, null, null);
+    const prev = pts.filter(x => x > rs && x <= t + 0.05 && x >= floor).pop();
+    if (prev !== undefined) { start = prev; break; }
+    if (rs <= floor) break;
+    e = rs + 1;                 // 1s overlap so a cut on the window edge isn't missed
+    step = Math.min(step * 2, 240);
+  }
+  return { start, end };
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  EXPORT — the engine lives in exporter.js (see the header there for details)
 // ═══════════════════════════════════════════════════════════════════════════════

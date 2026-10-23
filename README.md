@@ -40,6 +40,7 @@ Requires [Node.js](https://nodejs.org/) ≥ 18.
 | `Space` | Play / Pause |
 | `,` / `.` | Step one frame back / forward |
 | `↑` / `↓` | Volume up / down |
+| `S` | Find just the scene under the playhead (fast, single scene) |
 | `M` | Mute |
 | `F` | Fullscreen |
 | `Ctrl+Z` | Undo |

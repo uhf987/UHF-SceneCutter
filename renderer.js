@@ -152,6 +152,7 @@ async function loadFile(fp) {
   fileName.textContent = fp.split(/[\\/]/).pop() + (playable ? '' : ' ⚡ preview');
   analyzeBtn.style.display = '';
   $('analyzeRangeBtn').style.display = '';
+  $('analyzeSceneBtn').style.display = '';
   $('vr1').style.display = '';
 
   await new Promise(resolve => {
@@ -186,12 +187,17 @@ sensitivitySl.addEventListener('input', () => {
   sensitivityLbl.textContent = parseFloat(sensitivitySl.value).toFixed(2);
 });
 
+// Single progress listener (previously a new one was added on every click,
+// so labels flickered and listeners piled up). Each scan sets scanLabel.
+let scanLabel = 'Scanning';
+window.api.onDetectProgress(p => { ovMsg.textContent = `${scanLabel}... ${p}%`; });
+
 analyzeBtn.addEventListener('click', async () => {
   if (!file) return;
   const threshold = parseFloat(sensitivitySl.value) || 0.3;
   setOv(true, 'Scanning... 0%', 'May take 10–60 seconds depending on file length');
   scenes = [];
-  window.api.onDetectProgress(p => { ovMsg.textContent = `Scanning... ${p}%`; });
+  scanLabel = 'Scanning';
   try {
     const { changePoints, duration: d } = await window.api.detectScenes(originalFile || file, threshold);
     if (d > 0) dur = d;
@@ -218,7 +224,7 @@ $('analyzeRangeBtn').addEventListener('click', async () => {
   const rangeEnd   = Math.min(dur, center + HALF);
   const rangeLabel = `${fmt(rangeStart)} – ${fmt(rangeEnd)}`;
   setOv(true, 'Scanning range... 0%', `Analyzing range ${rangeLabel}`);
-  window.api.onDetectProgress(p => { ovMsg.textContent = `Scanning range... ${p}%`; });
+  scanLabel = 'Scanning range';
   try {
     const threshold = parseFloat(sensitivitySl.value) || 0.3;
     const { changePoints } = await window.api.detectScenesRange(originalFile || file, threshold, rangeStart, rangeEnd);
@@ -241,6 +247,90 @@ $('analyzeRangeBtn').addEventListener('click', async () => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+//  ANALYZE SCENE — scan only the scene under the playhead and
+//  drop cut lines ("columns") inside it. Press S for a shortcut.
+// ═══════════════════════════════════════════════════════════════
+const analyzeSceneBtn = $('analyzeSceneBtn');
+let flashTimer = null;
+
+function flashBadge(msg) {
+  const prev = `${scenes.length} scene${scenes.length===1?'':'s'}`;
+  scBadge.textContent = msg;
+  statLbl.textContent = msg;
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => {
+    scBadge.textContent = scenes.length ? prev : '';
+    statLbl.textContent = '';
+  }, 3000);
+}
+
+async function analyzeCurrentScene() {
+  if (!file || !dur || analyzeSceneBtn.disabled) return;
+  let t = vid.currentTime;
+  const MIN = 0.3;   // pieces shorter than this get merged into their neighbour
+
+  // Playhead sitting on the END line of a scene (within ~0.25s) means
+  // "the scene next to it" — nudge just past the line so the neighbour is scanned.
+  const tol = Math.max(0.25, 12 / pps());   // ~12 px on screen, at least 0.25s
+  const onEdge = scenes.find(s => t > s.end - tol && t <= s.end + 0.05);
+  if (onEdge) t = Math.min(dur - 0.01, onEdge.end + 0.02);
+
+  // Container: the existing scene under the playhead, or the empty gap
+  // (or whole video) the playhead is in. The search never leaves it.
+  let idx = scenes.findIndex(s => t >= s.start && t < s.end);
+  // Playhead exactly at the very end of the video → belongs to the last scene (only if it reaches the end)
+  if (idx < 0 && scenes.length && t >= dur - 0.05 && scenes[scenes.length-1].end >= dur - 0.05) idx = scenes.length - 1;
+  let rs, re;
+  if (idx >= 0) { rs = scenes[idx].start; re = scenes[idx].end; }
+  else {
+    const prev = [...scenes].reverse().find(s => s.end <= t);
+    const next = scenes.find(s => s.start > t);
+    rs = prev ? prev.end : 0;
+    re = next ? next.start : dur;
+  }
+  if (re - rs < MIN * 2) { flashBadge('Scene too short'); return; }
+
+  const threshold = parseFloat(sensitivitySl.value) || 0.3;
+  scanLabel = 'Finding scene';
+  setOv(true, 'Finding scene...', 'Only the scene under the playhead is scanned');
+  analyzeSceneBtn.disabled = true;
+  try {
+    const b = await window.api.detectSceneBounds(originalFile || file, threshold, t, dur, rs, re);
+    let s = Math.max(rs, b.start), e = Math.min(re, b.end);
+    if (s - rs < MIN) s = rs;
+    if (re - e < MIN) e = re;
+    if (e - s < MIN) { flashBadge('No scene found'); return; }
+
+    if (idx >= 0 && s === rs && e === re) {
+      flashBadge(`Playhead is inside S${idx+1} (${fmt(rs)}–${fmt(re)}) — move it onto the next scene or its line`);
+      return;
+    }
+
+    saveUndo();
+    const parentSel = idx >= 0 ? scenes[idx].selected : false;
+    const mid = { start: s, end: e, color: '', selected: true };   // new scene is ready to export
+    const pieces = [];
+    if (idx >= 0 && s > rs) pieces.push({ start: rs, end: s, color: '', selected: parentSel });
+    pieces.push(mid);
+    if (idx >= 0 && e < re) pieces.push({ start: e, end: re, color: '', selected: parentSel });
+
+    if (idx >= 0) scenes.splice(idx, 1, ...pieces);
+    else { scenes.push(mid); scenes.sort((x, y) => x.start - y.start); }
+
+    scenes.forEach((sc, i) => sc.color = scColor(i));
+    analyzed = true;
+    scBadge.textContent = `${scenes.length} scene${scenes.length===1?'':'s'}`;
+    updateExpBar();
+    updateTrimBtns();
+    drawTl();
+    scrollTlToTime(s);
+    drawTl();
+  } catch(err) { flashBadge('Error'); console.error(err); }
+  finally { setOv(false); analyzeSceneBtn.disabled = false; }
+}
+analyzeSceneBtn.addEventListener('click', analyzeCurrentScene);
+
+// ═══════════════════════════════════════════════════════════════
 //  SEEKBAR (top mini bar) — fully synced
 // ═══════════════════════════════════════════════════════════════
 function updateSeekbar() {
@@ -253,12 +343,17 @@ function updateSeekbar() {
 
 seekWrap.addEventListener('mousedown', e => { seeking = true; doSeek(e); });
 window.addEventListener('mousemove', e => { if (seeking) doSeek(e); });
-window.addEventListener('mouseup', () => { seeking = false; });
+window.addEventListener('mouseup', () => {
+  if (seeking && lastSeekT !== null) vid.currentTime = lastSeekT;   // exact position after fastSeek
+  seeking = false; lastSeekT = null;
+});
 
+let lastSeekT = null;
 function doSeek(e) {
   const r = seekWrap.getBoundingClientRect();
   const p = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
   const t = p * dur;
+  lastSeekT = t;
   if (vid.fastSeek) vid.fastSeek(t); else vid.currentTime = t;
   scrollTlToTime(t);
 }
@@ -630,9 +725,9 @@ function hitTest(px, py) {
     const sc = scenes[i];
     const x = t2x(sc.start), w = (sc.end - sc.start) * pps();
     // Left edge (shared with prev scene's right edge)
-    if (i > 0 && Math.abs(px - x) <= EDGE_W) return { idx: i, side: 'start' };
+    if (Math.abs(px - x) <= EDGE_W) return { idx: i, side: 'start' };
     // Right edge
-    if (i < scenes.length-1 && Math.abs(px - (x+w)) <= EDGE_W) return { idx: i, side: 'end' };
+    if (Math.abs(px - (x+w)) <= EDGE_W) return { idx: i, side: 'end' };
   }
   // Block hit
   for (let i = 0; i < scenes.length; i++) {
@@ -652,8 +747,11 @@ tlCanvas.addEventListener('mousedown', e => {
   if (hit && hit.side) {
     // Edge drag — resize scene boundary; undo snapshot ÖNCE al
     saveUndo();
+    const _sc = scenes[hit.idx], _pv = scenes[hit.idx-1], _nx = scenes[hit.idx+1];
     dragging = { type: 'edge', idx: hit.idx, side: hit.side, ox: px,
-      origStart: scenes[hit.idx].start, origEnd: scenes[hit.idx].end };
+      origStart: _sc.start, origEnd: _sc.end,
+      coupPrev: !!_pv && Math.abs(_pv.end - _sc.start) < 0.001,
+      coupNext: !!_nx && Math.abs(_nx.start - _sc.end) < 0.001 };
   } else if (hit && !hit.side) {
     // Block hit: start as potential click; becomes scrub if dragged
     const t = x2t(px);
@@ -699,20 +797,16 @@ tlCanvas.addEventListener('mousemove', e => {
     if (dragging.side === 'start') {
       // Moving left edge: expand/shrink this scene, shrink/expand previous
       const prev = scenes[dragging.idx - 1];
-      const newStart = Math.max(
-        prev ? prev.start + MIN : 0,
-        Math.min(sc.end - MIN, dragging.origStart + dt)
-      );
-      if (prev) prev.end = newStart;
+      const low = prev ? (dragging.coupPrev ? prev.start + MIN : prev.end) : 0;
+      const newStart = Math.max(low, Math.min(sc.end - MIN, dragging.origStart + dt));
+      if (prev && dragging.coupPrev) prev.end = newStart;
       sc.start = newStart;
     } else {
       // Moving right edge: expand/shrink this scene, shrink/expand next
       const next = scenes[dragging.idx + 1];
-      const newEnd = Math.min(
-        next ? next.end - MIN : dur,
-        Math.max(sc.start + MIN, dragging.origEnd + dt)
-      );
-      if (next) next.start = newEnd;
+      const high = next ? (dragging.coupNext ? next.end - MIN : next.start) : dur;
+      const newEnd = Math.min(high, Math.max(sc.start + MIN, dragging.origEnd + dt));
+      if (next && dragging.coupNext) next.start = newEnd;
       sc.end = newEnd;
     }
 
@@ -733,6 +827,11 @@ tlCanvas.addEventListener('mouseup', e => {
   const r = tlCanvas.getBoundingClientRect();
   const px = e.clientX - r.left;
 
+  // fastSeek() during scrubbing lands on the nearest keyframe — finish with an exact seek
+  if (e.button === 0 && dragging?.type === 'scrub') {
+    const exact = Math.max(0, Math.min(dur, x2t(px)));
+    vid.currentTime = exact;
+  }
   if (e.button === 0 && dragging?.type === 'scrub' && !dragging.moved && dragging.idx >= 0) {
     // Short left click = select/deselect
     scenes[dragging.idx].selected = !scenes[dragging.idx].selected;
@@ -941,6 +1040,7 @@ document.addEventListener('keydown', e => {
     case '.': e.preventDefault(); vid.currentTime=Math.min(dur, vid.currentTime + 1/fps); break;
     case 'ArrowUp':    e.preventDefault(); vid.volume=Math.min(1,vid.volume+0.1); volSl.value=vid.volume; break;
     case 'ArrowDown':  e.preventDefault(); vid.volume=Math.max(0,vid.volume-0.1); volSl.value=vid.volume; break;
+    case 's': case 'S': e.preventDefault(); analyzeCurrentScene(); break;
     case 'm': case 'M': muteBtn.click(); break;
     case 'f': case 'F': fsBtn.click(); break;
   }

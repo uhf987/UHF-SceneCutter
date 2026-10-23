@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('api', {
   getKeyframesNear:     (p, t, w)     => ipcRenderer.invoke('get-keyframes-near', p, t, w),
   detectScenes:         (p, th)       => ipcRenderer.invoke('detect-scenes', p, th),
   detectScenesRange:    (p, th, s, e) => ipcRenderer.invoke('detect-scenes-range', p, th, s, e),
+  detectSceneBounds:    (p, th, t, d, lo, hi) => ipcRenderer.invoke('detect-scene-bounds', p, th, t, d, lo, hi),
   exportScenes:         (opts)        => ipcRenderer.invoke('export-scenes', opts),
   showInFolder:         (p)           => ipcRenderer.invoke('show-in-folder', p),
   getPreviewCacheInfo:  ()            => ipcRenderer.invoke('get-preview-cache-info'),
