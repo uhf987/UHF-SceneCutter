@@ -3,7 +3,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
-const { exportScenes } = require('./exporter');
+const { exportScenes, isAttachedPic, pickFps } = require('./exporter');
 
 let ffmpegPath, ffprobePath;
 // In packaged app, ffmpeg/ffprobe are in process.resourcesPath (extraResources)
@@ -69,33 +69,85 @@ ipcMain.handle('open-file-dialog', async () => {
   return r.canceled ? null : r.filePaths[0];
 });
 
-ipcMain.handle('open-save-dialog', async (_, name) => {
-  const ext = (name.match(/\.([^.]+)$/) || ['','mp4'])[1].toLowerCase();
+// Suggests the next free name next to the source file: name_kesim_1.mp4, _2, _3 ...
+function nextFreeName(inputPath, name) {
+  const dir = path.dirname(inputPath);
+  const base = (name || 'output').replace(/\.[^.]+$/, '').replace(/_kesim(_\d+)?$/, '');
+  for (let n = 1; n < 10000; n++) {
+    const p = path.join(dir, `${base}_kesim_${n}.mp4`);
+    if (!fs.existsSync(p)) return p;
+  }
+  return path.join(dir, `${base}_kesim.mp4`);
+}
+
+ipcMain.handle('open-save-dialog', async (_, name, inputPath) => {
   const r = await dialog.showSaveDialog(mainWindow, {
-    defaultPath: name || 'output.mp4',
-    filters: [
-      { name: ext.toUpperCase() + ' (original format)', extensions: [ext] },
-      { name: 'MKV (universal — recommended)', extensions: ['mkv'] },
-      { name: 'MP4', extensions: ['mp4'] },
-      { name: 'Other', extensions: ['mov','avi','webm','ts'] }
-    ]
+    defaultPath: inputPath ? nextFreeName(inputPath, name) : (name || 'output.mp4'),
+    filters: [{ name: 'MP4 (H.264 + AAC)', extensions: ['mp4'] }]
   });
-  return r.canceled ? null : r.filePath;
+  if (r.canceled) return null;
+  return /\.mp4$/i.test(r.filePath) ? r.filePath : r.filePath + '.mp4';
 });
 
 ipcMain.handle('get-video-info', async (_, fp) =>
   runFFprobe(['-v','quiet','-print_format','json','-show_format','-show_streams', fp])
 );
 
+// Real video stream info (skips MP4 cover art), cached per file
+const metaCache = new Map();
+async function getVideoMeta(fp) {
+  if (metaCache.has(fp)) return metaCache.get(fp);
+  const info = await runFFprobe(['-v','quiet','-print_format','json','-show_streams', fp]);
+  const v = (info.streams||[]).find(s => s.codec_type === 'video' && !isAttachedPic(s));
+  if (!v) throw new Error('no video stream');
+  const r = pickFps(v);
+  // snap to exact NTSC rationals so frame times don't drift
+  let { n, d } = r;
+  const ntsc = Math.round(r.v * 1001 / 1000);
+  if (Math.abs(r.v - ntsc * 1000 / 1001) < 0.02) { n = ntsc * 1000; d = 1001; }
+  const meta = { index: v.index, n, d, fps: n / d };
+  metaCache.set(fp, meta);
+  if (metaCache.size > 20) metaCache.delete(metaCache.keys().next().value);
+  return meta;
+}
+
 ipcMain.handle('get-fps', async (_, fp) => {
-  try {
-    const info = await runFFprobe(['-v','quiet','-print_format','json','-show_streams','-select_streams','v:0', fp]);
-    const st = (info.streams||[])[0];
-    if (!st) return 25;
-    const rfr = st.r_frame_rate || st.avg_frame_rate || '25/1';
-    const [n, d] = rfr.split('/').map(Number);
-    return d ? n/d : 25;
-  } catch(e) { return 25; }
+  try { return (await getVideoMeta(fp)).fps; } catch(e) { return 25; }
+});
+
+// ─── filmstrip frames ─────────────────────────────────────────────────────────
+// Returns `count` JPEGs (base64): frames startFrame, startFrame+step, ...
+// Always decoded from the ORIGINAL file, so it works for every format.
+function splitJpegs(buf) {
+  const out = []; let i = 0;
+  const soi = Buffer.from([0xFF, 0xD8]), eoi = Buffer.from([0xFF, 0xD9]);
+  for (;;) {
+    const s = buf.indexOf(soi, i); if (s < 0) break;
+    const e = buf.indexOf(eoi, s + 2); if (e < 0) break;
+    out.push(buf.subarray(s, e + 2).toString('base64'));
+    i = e + 2;
+  }
+  return out;
+}
+
+ipcMain.handle('get-frames', async (_, fp, startFrame, count, step, w, h) => {
+  const m = await getVideoMeta(fp);
+  step = Math.max(1, step|0); count = Math.max(1, Math.min(150, count|0));
+  w = Math.max(16, w|0); h = Math.max(16, h|0);
+  const ss = Math.max(0, (startFrame - 0.5) / m.fps);
+  const args = ['-hide_banner','-loglevel','error','-nostdin'];
+  if (ss > 0) args.push('-ss', ss.toFixed(6));
+  args.push('-i', fp, '-map', `0:${m.index}`, '-an','-sn','-dn',
+    '-vf', `fps=${m.n}/${m.d * step},scale=${w}:${h}:flags=fast_bilinear`,
+    '-frames:v', String(count), '-f','image2pipe','-c:v','mjpeg','-q:v','5','pipe:1');
+  return new Promise(res => {
+    const p = spawn(ffmpegPath, args);
+    const chunks = [];
+    p.stdout.on('data', d => chunks.push(d));
+    p.stderr.on('data', () => {});
+    p.on('close', () => res(splitJpegs(Buffer.concat(chunks))));
+    p.on('error', () => res([]));
+  });
 });
 
 // ─── playability check ────────────────────────────────────────────────────────
@@ -301,15 +353,13 @@ ipcMain.handle('detect-scene-bounds', async (_, fp, th, t, total, lo, hi) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  EXPORT — the engine lives in exporter.js (see the header there for details)
 // ═══════════════════════════════════════════════════════════════════════════════
-ipcMain.handle('export-scenes', async (_, { inputPath, scenes, outputPath, mode }) =>
+ipcMain.handle('export-scenes', async (_, { inputPath, scenes, outputPath }) =>
   exportScenes({
-    inputPath, scenes, outputPath, mode,
+    inputPath, scenes, outputPath,
     ffmpegPath, ffprobePath,
-    tmpDir: path.join(os.tmpdir(), 'scene-cutter-export'),
     send: d => mainWindow.webContents.send('export-progress', d)
   })
 );
-
 
 ipcMain.handle('show-in-folder', async (_, fp) => shell.showItemInFolder(fp));
 

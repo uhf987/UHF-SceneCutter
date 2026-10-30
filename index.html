@@ -83,12 +83,6 @@ input[type=range] { -webkit-appearance:none; height:3px; border-radius:2px;
 input[type=range]::-webkit-slider-thumb { -webkit-appearance:none; width:11px;
   height:11px; background:var(--accent); border-radius:50%; }
 
-/* ── Cut Mode ── */
-.cut-mode-wrap { display:flex; align-items:center; gap:5px; }
-.cut-mode-wrap label { font-size:10px; color:var(--text2); white-space:nowrap; }
-#cutMode { background:var(--s3); color:var(--text); border:1px solid var(--border);
-  border-radius:var(--r); padding:3px 7px; font-size:11px; cursor:pointer; outline:none; transition:border-color .15s; }
-#cutMode:hover, #cutMode:focus { border-color:var(--accent); }
 
 /* ── Timeline ── */
 .tl-section { flex:1; display:flex; flex-direction:column; min-height:0; }
@@ -112,6 +106,18 @@ canvas { display:block; }
 .prog.on { display:block; }
 .prog-fill { height:100%; background:var(--accent); width:0%; transition:width .3s; }
 .stat { font-size:10px; color:var(--text2); min-width:160px; }
+
+
+/* ── Filmstrip ── */
+.strip { display:none; flex-direction:column; flex-shrink:0; background:var(--s1); border-top:1px solid var(--border); }
+.strip.on { display:flex; }
+.strip-hdr { display:flex; align-items:center; gap:8px; padding:4px 12px; }
+.strip-hdr h3 { font-size:11px; font-weight:700; color:var(--text2); text-transform:uppercase; letter-spacing:.5px; }
+.strip-hdr .hint { font-size:10px; color:var(--text2); }
+.strip-hdr select { background:var(--s3); color:var(--text); border:1px solid var(--border);
+  border-radius:var(--r); padding:2px 6px; font-size:11px; outline:none; cursor:pointer; }
+.strip-wrap { height:88px; position:relative; cursor:grab; background:#0d0d10; }
+.strip-wrap.drag { cursor:grabbing; }
 
 /* ── Cache modal ── */
 .modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.65); z-index:300;
@@ -153,7 +159,7 @@ canvas { display:block; }
 </div>
 
 <!-- Player -->
-<div class="player" id="player" style="height:44vh">
+<div class="player" id="player" style="height:38vh">
   <div class="drop" id="drop">
     <svg width="52" height="52" fill="none" viewBox="0 0 24 24" stroke="currentColor">
       <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1"
@@ -238,6 +244,26 @@ canvas { display:block; }
   </div>
 </div>
 
+<!-- Filmstrip -->
+<div class="strip" id="stripSec">
+  <div class="strip-hdr">
+    <h3>Filmstrip</h3>
+    <span class="badge a" id="stripTc">0:00:00:00</span>
+    <span class="badge" id="stripFrame">frame 0</span>
+    <div class="sp"></div>
+    <span class="hint">Scroll / drag / click = frame by frame · Shift+scroll = ×10 · C = cut here</span>
+    <label for="stripStep" style="font-size:10px;color:var(--text2)">Step</label>
+    <select id="stripStep">
+      <option value="1">1 frame</option>
+      <option value="2">2 frames</option>
+      <option value="5">5 frames</option>
+      <option value="10">10 frames</option>
+      <option value="25">25 frames</option>
+    </select>
+  </div>
+  <div class="strip-wrap" id="stripWrap"><canvas id="strip"></canvas></div>
+</div>
+
 <!-- Timeline -->
 <div class="tl-section" id="tlSection" style="display:none">
   <div class="tl-hdr">
@@ -268,18 +294,7 @@ canvas { display:block; }
   <div class="exp-info" id="expInfo">Analyze or select scenes to export</div>
   <div class="prog" id="prog"><div class="prog-fill" id="progFill"></div></div>
   <span class="stat" id="statLbl"></span>
-  <div class="cut-mode-wrap">
-    <label for="cutMode"
-      title="Smart Cut: only re-encodes tiny non-keyframe boundaries, rest is lossless copy.&#10;Lossless: pure stream copy, snaps to nearest keyframe.&#10;Re-encode: full quality-matched re-encode.">
-      Cut mode:
-    </label>
-    <select id="cutMode">
-      <option value="smart">🧠 Smart Cut</option>
-      <option value="lossless">⚡ Lossless</option>
-
-    </select>
-  </div>
-  <button class="btn btn-red" id="expBtn" disabled>✂️ Export</button>
+  <button class="btn btn-red" id="expBtn" disabled>✂️ Export MP4</button>
 </div>
 
 <!-- Context menu -->

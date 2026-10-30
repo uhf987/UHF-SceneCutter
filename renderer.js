@@ -78,6 +78,13 @@ const sensitivityLbl=$('sensitivityLbl');
 const fileName   = $('fileName');
 const ctx        = tlCanvas.getContext('2d');
 const ctxMenu    = $('ctx');
+const stripSec   = $('stripSec');
+const stripWrap  = $('stripWrap');
+const stripCv    = $('strip');
+const sctx       = stripCv.getContext('2d');
+const stripStepSel = $('stripStep');
+const stripTc    = $('stripTc');
+const stripFrameLbl = $('stripFrame');
 
 // ═══════════════════════════════════════════════════════════════
 //  HELPERS
@@ -171,10 +178,12 @@ async function loadFile(fp) {
   tlBase = Math.max(20, tlWrap.clientWidth / Math.max(dur, 1));
   tlZoom = 1; tlOff = 0;
   zoomSl.value = 1; zoomLbl.textContent = '1×';
-  window.api.getFps(fp).then(f => { fps = f || 25; }).catch(() => {});
+  try { fps = (await window.api.getFps(fp)) || 25; } catch(e) { fps = 25; }
+  stripInit();
   keyframes = []; if(kfStrip) kfStrip.innerHTML = '';
   setTimeout(() => fetchAndRenderAllKfs(), 500);
   setOv(false);
+  resizeStrip();
   drawTl();
   updateExpBar();
   updateTrimBtns();
@@ -373,6 +382,24 @@ function scrollTlToTime(t) {
   }
 }
 
+// Move the playhead and update seekbar + timeline + filmstrip right away.
+function seekTo(t) {
+  if (!file || !dur) return;
+  t = Math.max(0, Math.min(Math.max(0, dur - 0.001), t));
+  vid.currentTime = t;
+  updateSeekbar();
+  scrollTlToTime(t);
+  drawTl();
+}
+const curFrame  = () => Math.floor(vid.currentTime * fps + 1e-6);
+const lastFrame = () => Math.max(0, Math.round(dur * fps) - 1);
+// aim at the middle of a frame so the browser shows exactly that frame
+const frameTime = f => (f + 0.5) / fps;
+function stepFrames(n) {
+  const f = Math.max(0, Math.min(lastFrame(), curFrame() + n));
+  seekTo(frameTime(f));
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  PLAY / PAUSE
 // ═══════════════════════════════════════════════════════════════
@@ -391,13 +418,14 @@ function togglePlay() {
 vid.addEventListener('play',  () => { setPlayIcon(true);  startRaf(); });
 vid.addEventListener('pause', () => { setPlayIcon(false); stopRaf(); drawTl(); });
 vid.addEventListener('ended', () => { setPlayIcon(false); stopRaf(); drawTl(); });
-vid.addEventListener('seeked', () => { updateSeekbar(); drawTl(); });
+vid.addEventListener('seeked', () => { updateSeekbar(); scrollTlToTime(vid.currentTime); drawTl(); });
 
 // RAF loop: update seekbar + playhead while playing
 function startRaf() {
   if (raf) return;
   function loop() {
     updateSeekbar();
+    scrollTlToTime(vid.currentTime);
     drawTl();
     raf = requestAnimationFrame(loop);
   }
@@ -405,14 +433,8 @@ function startRaf() {
 }
 function stopRaf() { if (raf) { cancelAnimationFrame(raf); raf = null; } }
 
-btnFrameB.addEventListener('click', () => {
-  const frameSec = 1 / fps;
-  vid.currentTime = Math.max(0, vid.currentTime - frameSec);
-});
-btnFrameF.addEventListener('click', () => {
-  const frameSec = 1 / fps;
-  vid.currentTime = Math.min(dur, vid.currentTime + frameSec);
-});
+btnFrameB.addEventListener('click', () => stepFrames(-1));
+btnFrameF.addEventListener('click', () => stepFrames(1));
 
 // ── Trim butonlarını aktif/pasif yap ──────────────────────────────────
 function updateTrimBtns() {
@@ -535,11 +557,15 @@ btnAddScene.addEventListener('click', () => {
   drawTl();
 });
 
-// Player scroll wheel → scrub ±2s
+// Player scroll wheel → scrub (±2s per notch, Shift = one frame).
+// seekTo() moves the playhead / timeline / filmstrip immediately instead of
+// waiting for the video's async 'seeked' event.
 player.addEventListener('wheel', e => {
   if (!file) return;
   e.preventDefault();
-  vid.currentTime = Math.max(0, Math.min(dur, vid.currentTime + (e.deltaY > 0 ? 2 : -2)));
+  if (e.shiftKey) { stepFrames(e.deltaY > 0 ? 1 : -1); return; }
+  const k = Math.max(-1, Math.min(1, e.deltaY / 100));      // trackpads send small deltas
+  seekTo(vid.currentTime + 2 * k);
 }, { passive: false });
 
 muteBtn.addEventListener('click', () => { vid.muted = !vid.muted; volSl.value = vid.muted ? 0 : vid.volume; });
@@ -550,6 +576,217 @@ volSl.addEventListener('wheel', e => {
   volSl.value = vid.volume;
 }, { passive: false });
 fsBtn.addEventListener('click', () => { document.fullscreenElement ? document.exitFullscreen() : player.requestFullscreen(); });
+
+// ═══════════════════════════════════════════════════════════════
+//  FILMSTRIP — frame-by-frame strip, playhead fixed in the centre
+//  Frames come from ffmpeg (original file), cached by frame number.
+// ═══════════════════════════════════════════════════════════════
+const STRIP_TH = 58;               // thumbnail height (css px)
+const STRIP_H  = 88;               // canvas height
+let stripOn = false, stripTW = 100, stripStep = 1;
+let stripCache = new Map();        // "step|frame" -> Image | false (no frame there)
+let stripTries = new Map();
+let stripTimer = null, stripGen = 0;
+const stripInflight = [];          // frame ranges currently being fetched
+const stripPrev = document.createElement('canvas');   // last fully loaded render (shown dimmed while new frames load)
+let stripPrevOk = false;
+let stripDrag = null, stripAcc = 0;
+
+const sKey = (s, f) => s + '|' + f;
+const tcStr = f => {
+  const t = f / fps, h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), sec = Math.floor(t % 60);
+  const ff = Math.min(Math.round(fps) - 1, Math.floor((t - Math.floor(t)) * fps + 1e-6));
+  return (h ? h + ':' : '') + (h ? p2(m) : m) + ':' + p2(sec) + ':' + p2(ff);
+};
+// x position of the thumbnail for frame f (centre of the cell)
+const stripX = (f, cur) => stripCv.clientWidth / 2 + (f - cur) / stripStep * stripTW;
+
+function stripInit() {
+  stripGen++;
+  stripCache.clear(); stripTries.clear(); stripInflight.length = 0; stripPrevOk = false;
+  const ar = (vid.videoWidth && vid.videoHeight) ? vid.videoWidth / vid.videoHeight : 16 / 9;
+  stripTW = Math.max(30, Math.min(170, Math.round(STRIP_TH * ar)));
+  stripOn = true;
+  stripSec.classList.add('on');
+}
+
+function resizeStrip() {
+  const r = stripWrap.getBoundingClientRect();
+  if (!r.width) return;
+  const dpr = window.devicePixelRatio || 1;
+  stripCv.width = r.width * dpr; stripCv.height = STRIP_H * dpr;
+  stripCv.style.width = r.width + 'px'; stripCv.style.height = STRIP_H + 'px';
+  sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  stripPrev.width = stripCv.width; stripPrev.height = stripCv.height; stripPrevOk = false;
+  drawStrip();
+}
+new ResizeObserver(resizeStrip).observe(stripWrap);
+
+// frame numbers (multiples of the step) that are on screen, plus a prefetch margin
+function stripFrames(cur, margin) {
+  const W = stripCv.clientWidth, s = stripStep, last = lastFrame();
+  const span = (W / 2 / stripTW + 1 + margin) * s;
+  const out = [];
+  for (let f = Math.ceil((cur - span) / s) * s; f <= cur + span; f += s)
+    if (f >= 0 && f <= last) out.push(f);
+  return out;
+}
+
+function drawStrip() {
+  if (!stripOn || !dur || !stripCv.clientWidth) return;
+  const W = stripCv.clientWidth, H = STRIP_H, s = stripStep, TW = stripTW;
+  const cur = curFrame();
+  sctx.globalAlpha = 1;
+  sctx.fillStyle = '#0d0d10'; sctx.fillRect(0, 0, W, H);
+
+  const frames = stripFrames(cur, 0);
+  const missing = frames.some(f => stripCache.get(sKey(s, f)) === undefined);
+  // New frames still loading → keep showing the previous picture (dimmed)
+  // instead of empty boxes, so the strip never "disappears" while scrubbing.
+  const stale = missing && stripPrevOk;
+  if (stale) {
+    sctx.globalAlpha = 0.4;
+    sctx.drawImage(stripPrev, 0, 0, W, H);
+    sctx.globalAlpha = 1;
+  }
+
+  const labelEvery = Math.max(1, Math.ceil(64 / TW));
+  sctx.font = '9px sans-serif'; sctx.textAlign = 'center';
+  for (const f of frames) {
+    const x = stripX(f, cur) - TW / 2, y = 3;
+    const img = stripCache.get(sKey(s, f));
+    if (img) sctx.drawImage(img, x + 1, y, TW - 2, STRIP_TH);
+    else if (!stale) { sctx.fillStyle = '#17171c'; sctx.fillRect(x + 1, y, TW - 2, STRIP_TH); }
+    if (!stale || img) {
+      if ((f / s) % labelEvery === 0) {
+        sctx.fillStyle = f === cur ? '#ff7a90' : '#66668a';
+        sctx.fillText(tcStr(f), x + TW / 2, y + STRIP_TH + 11);
+      }
+    }
+  }
+  // snapshot of the complete thumbnails (without markers) for the "stale" fallback
+  if (!missing) {
+    const pc = stripPrev.getContext('2d');
+    pc.setTransform(1, 0, 0, 1, 0, 0);
+    pc.clearRect(0, 0, stripPrev.width, stripPrev.height);
+    pc.drawImage(stripCv, 0, 0);
+    stripPrevOk = true;
+  }
+
+  // scene bands + cut lines (cut = left edge of the first frame of a scene)
+  const uX = u => W / 2 + (u - cur) / s * TW - TW / 2;
+  scenes.forEach(sc => {
+    const x1 = uX(sc.start * fps), x2 = uX(sc.end * fps);
+    if (x2 < 0 || x1 > W) return;
+    sctx.globalAlpha = sc.selected ? 1 : 0.55;
+    sctx.fillStyle = sc.color;
+    sctx.fillRect(x1, H - 7, Math.max(2, x2 - x1), 5);
+    sctx.globalAlpha = 1;
+    sctx.fillStyle = 'rgba(255,255,255,.9)';
+    if (x1 >= 0 && x1 <= W) sctx.fillRect(x1 - 1, 0, 2, STRIP_TH + 6);
+    if (x2 >= 0 && x2 <= W) sctx.fillRect(x2 - 1, 0, 2, STRIP_TH + 6);
+  });
+
+  // current frame marker
+  const cx = W / 2;
+  sctx.strokeStyle = '#ff4060'; sctx.lineWidth = 2;
+  if (s === 1) sctx.strokeRect(cx - TW / 2 + 1, 2, TW - 2, STRIP_TH + 2);
+  else { sctx.beginPath(); sctx.moveTo(cx, 0); sctx.lineTo(cx, STRIP_TH + 6); sctx.stroke(); }
+  sctx.fillStyle = '#ff4060';
+  sctx.beginPath(); sctx.moveTo(cx - 5, 0); sctx.lineTo(cx + 5, 0); sctx.lineTo(cx, 7); sctx.fill();
+
+  stripTc.textContent = tcStr(cur);
+  stripFrameLbl.textContent = 'frame ' + cur;
+  if (missing) scheduleStripFetch();
+}
+
+function scheduleStripFetch() {
+  if (stripTimer) return;
+  stripTimer = setTimeout(() => { stripTimer = null; runStripFetch(); }, vid.paused ? 30 : 250);
+}
+
+async function runStripFetch() {
+  if (!stripOn || !file || stripInflight.length >= 3) return;
+  const s = stripStep, cur = curFrame();
+  const covered = f => stripInflight.some(r => r.s === s && f >= r.lo && f <= r.hi);
+  const miss = margin => stripFrames(cur, margin).filter(f => !stripCache.has(sKey(s, f)) && !covered(f));
+  // visible frames first (small, fast request); prefetch the margin once those are in
+  let need = miss(0);
+  if (!need.length && !stripInflight.length) need = miss(6);
+  if (!need.length) return;
+  need.sort((a, b) => Math.abs(a - cur) - Math.abs(b - cur));
+  let lo = need[0], hi = need[0];
+  for (const f of need) { if (f < lo && hi - f <= 60 * s) lo = f; if (f > hi && f - lo <= 60 * s) hi = f; }
+  const count = Math.round((hi - lo) / s) + 1;
+  const gen = stripGen, job = { lo, hi, s };
+  stripInflight.push(job);
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const ev = n => Math.max(16, Math.round(n * dpr / 2) * 2);
+  let res = [];
+  try { res = await window.api.getFrames(originalFile || file, lo, count, s, ev(stripTW), ev(STRIP_TH)); } catch(e) {}
+  const imgs = await Promise.all(res.map(b64 => new Promise(ok => {
+    const im = new Image();
+    im.onload = () => ok(im); im.onerror = () => ok(null);
+    im.src = 'data:image/jpeg;base64,' + b64;
+  })));
+  const ji = stripInflight.indexOf(job); if (ji >= 0) stripInflight.splice(ji, 1);
+  if (gen !== stripGen) return;
+  for (let i = 0; i < count; i++) {
+    const k = sKey(s, lo + i * s);
+    if (imgs[i]) stripCache.set(k, imgs[i]);
+    else {
+      const n = (stripTries.get(k) || 0) + 1; stripTries.set(k, n);
+      if (n >= 2 || i >= imgs.length && (lo + i * s) >= lastFrame() - 1) stripCache.set(k, false);
+    }
+  }
+  while (stripCache.size > 700) stripCache.delete(stripCache.keys().next().value);
+  drawStrip();
+  scheduleStripFetch();
+}
+
+stripStepSel.addEventListener('change', () => {
+  stripStep = parseInt(stripStepSel.value) || 1;
+  stripStepSel.blur();
+  drawStrip();
+});
+
+// click = jump to frame · drag = pull the film · wheel = step
+stripWrap.addEventListener('mousedown', e => {
+  if (e.button !== 0 || !stripOn) return;
+  const x = e.clientX - stripWrap.getBoundingClientRect().left;
+  stripDrag = { x0: x, cf0: vid.currentTime * fps, moved: false };
+  stripWrap.classList.add('drag');
+});
+window.addEventListener('mousemove', e => {
+  if (!stripDrag) return;
+  const x = e.clientX - stripWrap.getBoundingClientRect().left;
+  const dx = x - stripDrag.x0;
+  if (Math.abs(dx) > 3) stripDrag.moved = true;
+  if (!stripDrag.moved) return;
+  seekTo((stripDrag.cf0 - dx / stripTW * stripStep) / fps);
+});
+window.addEventListener('mouseup', e => {
+  if (!stripDrag) return;
+  const d = stripDrag; stripDrag = null;
+  stripWrap.classList.remove('drag');
+  if (d.moved) return;
+  const x = e.clientX - stripWrap.getBoundingClientRect().left;
+  const f = Math.round(curFrame() + (x - stripCv.clientWidth / 2) / stripTW * stripStep);
+  seekTo(frameTime(Math.max(0, Math.min(lastFrame(), f))));
+});
+stripWrap.addEventListener('wheel', e => {
+  if (!file) return;
+  e.preventDefault();
+  let notches;
+  if (Math.abs(e.deltaY) >= 50) { notches = Math.sign(e.deltaY); stripAcc = 0; }   // mouse wheel notch
+  else {                                                                           // trackpad: accumulate
+    stripAcc += e.deltaY;
+    notches = Math.trunc(stripAcc / 40);
+    if (!notches) return;
+    stripAcc -= notches * 40;
+  }
+  stepFrames(notches * stripStep * (e.shiftKey ? 10 : 1));
+}, { passive: false });
 
 // ═══════════════════════════════════════════════════════════════
 //  TIMELINE — CANVAS
@@ -692,6 +929,7 @@ function drawTl() {
     ctx.beginPath(); ctx.moveTo(ph-6, 0); ctx.lineTo(ph+6, 0); ctx.lineTo(ph, 10); ctx.fill();
   }
   ctx.globalAlpha = 1;
+  drawStrip();
 }
 
 function drawBlock(x, y, w, h, rLeft, rRight) {
@@ -979,51 +1217,43 @@ function mergeAdjacentSegments(segs) {
   return merged;
 }
 
+let exportEncoder = '';
+// progress listener is registered once (it used to pile up on every export)
+window.api.onExportProgress(d => {
+  if (d.status === 'scanning')      { statLbl.textContent = 'Analysing source...'; progFill.style.width = '3%'; }
+  else if (d.status === 'encoding') {
+    if (d.encoder) exportEncoder = d.encoder;
+    statLbl.textContent = `Encoding MP4 (${exportEncoder})... ${Math.floor(d.pct || 0)}%`; progFill.style.width = Math.max(3, d.pct || 0) + '%';
+  }
+  else if (d.status === 'done')     { progFill.style.width = '100%'; }
+});
+
 expBtn.addEventListener('click', async () => {
   const rawSel = scenes.filter(s => s.selected).map(s => ({ start: s.start, end: s.end }));
   if (!rawSel.length) return;
   const sel = mergeAdjacentSegments(rawSel);
-  const ext = (file.match(/\.([^.]+)$/) || ['','mp4'])[1];
   const base = file.split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
-  const out = await window.api.openSaveDialog(`${base}_kesim.${ext}`);
+  const out = await window.api.openSaveDialog(`${base}.mp4`, originalFile || file);
   if (!out) return;
 
-  // Read cut mode from UI selector
-  const cutModeEl = document.getElementById('cutMode');
-  const mode = cutModeEl ? cutModeEl.value : 'smart';
-
   expBtn.disabled = true; clearSelBtn.disabled = true;
-  prog.classList.add('on'); progFill.style.width = '5%'; statLbl.textContent = 'Starting...';
-
-  const methodLabel = { lossless: '⚡ Lossless', smart: '🧠 Smart' };
-
-  window.api.onExportProgress(d => {
-    if (d.status==='scanning')   { statLbl.textContent='Scanning video...'; progFill.style.width='5%'; }
-    else if (d.status==='keyframes') { statLbl.textContent=`Finding keyframes ${d.current}/${d.total}...`; progFill.style.width=Math.round(5+(d.current/d.total)*10)+'%'; }
-    else if (d.status==='cutting') {
-      const m = methodLabel[d.method] || '';
-      statLbl.textContent=`${m} Cutting ${d.current}/${d.total}...`;
-      progFill.style.width=Math.round(15+(d.current/d.total)*70)+'%';
-    }
-    else if (d.status==='merging') { statLbl.textContent='Merging...'; progFill.style.width='90%'; }
-    else if (d.status==='done')    { progFill.style.width='100%'; }
-  });
+  prog.classList.add('on'); progFill.style.width = '3%'; statLbl.textContent = 'Starting...';
 
   try {
-    const fp = await window.api.exportScenes({ inputPath: originalFile || file, scenes: sel, outputPath: out, mode });
+    const fp = await window.api.exportScenes({ inputPath: originalFile || file, scenes: sel, outputPath: out });
     statLbl.textContent = '✅ Done!';
     setTimeout(() => {
       window.api.showInFolder(fp);
-      prog.classList.remove('on'); progFill.style.width='0%'; statLbl.textContent='';
-      expBtn.disabled=false; clearSelBtn.disabled=false;
-      // Export sonrası seçili sahneleri sıfırla
+      prog.classList.remove('on'); progFill.style.width = '0%'; statLbl.textContent = '';
+      expBtn.disabled = false; clearSelBtn.disabled = false;
       scenes.forEach(s => s.selected = false);
       drawTl();
       updateExpBar();
     }, 2000);
   } catch(err) {
-    statLbl.textContent = '❌ ' + err.message.split('\n')[0];
-    prog.classList.remove('on'); expBtn.disabled=false; clearSelBtn.disabled=false;
+    statLbl.textContent = '❌ ' + err.message.split('\n').pop();
+    statLbl.title = err.message;
+    prog.classList.remove('on'); expBtn.disabled = false; clearSelBtn.disabled = false;
   }
 });
 
@@ -1036,8 +1266,10 @@ document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); undo(); return; }
   switch(e.key) {
     case ' ': e.preventDefault(); togglePlay(); break;
-    case ',': e.preventDefault(); vid.currentTime=Math.max(0, vid.currentTime - 1/fps); break;
-    case '.': e.preventDefault(); vid.currentTime=Math.min(dur, vid.currentTime + 1/fps); break;
+    case ',': case 'ArrowLeft':  e.preventDefault(); stepFrames(e.shiftKey ? -10 : -1); break;
+    case '.': case 'ArrowRight': e.preventDefault(); stepFrames(e.shiftKey ? 10 : 1); break;
+    case 'c': case 'C': e.preventDefault(); btnAddTrim.click(); break;
+    case 't': case 'T': e.preventDefault(); btnSnapTrim.click(); break;
     case 'ArrowUp':    e.preventDefault(); vid.volume=Math.min(1,vid.volume+0.1); volSl.value=vid.volume; break;
     case 'ArrowDown':  e.preventDefault(); vid.volume=Math.max(0,vid.volume-0.1); volSl.value=vid.volume; break;
     case 's': case 'S': e.preventDefault(); analyzeCurrentScene(); break;
@@ -1136,21 +1368,6 @@ function scheduleKfFetch() {
 
 vid.addEventListener('pause', scheduleKfFetch);
 vid.addEventListener('seeked', scheduleKfFetch);
-
-// ── Cut Mode badge update ─────────────────────────────────────
-const cutModeEl = $('cutMode');
-function updateCutModeBadge() {
-  if (!cutModeEl) return;
-  // Update export button label to hint the mode
-  const labels = {
-    smart:    '✂️ Export (Smart Cut)',
-    lossless: '✂️ Export (Lossless)',
-
-  };
-  const expBtn = $('expBtn');
-  if (expBtn) expBtn.textContent = labels[cutModeEl.value] || '✂️ Export';
-}
-if (cutModeEl) cutModeEl.addEventListener('change', updateCutModeBadge);
 
 // ── Hook fetchAndRenderAllKfs into loadFile ────────────────────
 // Patch loadFile to also trigger KF fetch after load

@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('api', {
   openFileDialog:       ()            => ipcRenderer.invoke('open-file-dialog'),
-  openSaveDialog:       (name)        => ipcRenderer.invoke('open-save-dialog', name),
+  openSaveDialog:       (name, src)   => ipcRenderer.invoke('open-save-dialog', name, src),
   getVideoInfo:         (p)           => ipcRenderer.invoke('get-video-info', p),
   getFps:               (p)           => ipcRenderer.invoke('get-fps', p),
   checkPlayability:     (p)           => ipcRenderer.invoke('check-playability', p),
@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('api', {
   detectScenes:         (p, th)       => ipcRenderer.invoke('detect-scenes', p, th),
   detectScenesRange:    (p, th, s, e) => ipcRenderer.invoke('detect-scenes-range', p, th, s, e),
   detectSceneBounds:    (p, th, t, d, lo, hi) => ipcRenderer.invoke('detect-scene-bounds', p, th, t, d, lo, hi),
+  getFrames:            (p, f, n, st, w, h) => ipcRenderer.invoke('get-frames', p, f, n, st, w, h),
   exportScenes:         (opts)        => ipcRenderer.invoke('export-scenes', opts),
   showInFolder:         (p)           => ipcRenderer.invoke('show-in-folder', p),
   getPreviewCacheInfo:  ()            => ipcRenderer.invoke('get-preview-cache-info'),
